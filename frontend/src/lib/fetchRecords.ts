@@ -1,13 +1,18 @@
 import { supabase } from './supabase';
 import { NormalizedOutput, NormalizedRecord } from './normalize';
 
-export async function fetchRecords(): Promise<NormalizedOutput> {
+export interface FetchRecordsFilters {
+  startDate?: string; // formato YYYY-MM-DD
+  endDate?: string;   // formato YYYY-MM-DD
+}
+
+export async function fetchRecords(filters?: FetchRecordsFilters): Promise<NormalizedOutput> {
   if (!supabase) {
     throw new Error('Supabase client not initialized. Check your environment variables.');
   }
 
-  // Buscar todas as NF-e (agora em tabela única)
-  const { data: nfeData, error: nfeError } = await supabase
+  // Construir query base
+  let query = supabase
     .from('nfe')
     .select(`
       id,
@@ -24,8 +29,18 @@ export async function fetchRecords(): Promise<NormalizedOutput> {
         id,
         nome
       )
-    `)
-    .order('data_nota', { ascending: true });
+    `);
+
+  // Aplicar filtro de data se fornecido
+  if (filters?.startDate) {
+    query = query.gte('data_nota', filters.startDate);
+  }
+  if (filters?.endDate) {
+    query = query.lte('data_nota', filters.endDate);
+  }
+
+  // Ordenar por data
+  const { data: nfeData, error: nfeError } = await query.order('data_nota', { ascending: true });
 
   if (nfeError) {
     console.error('Error fetching nfe:', nfeError);

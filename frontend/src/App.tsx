@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { processExcelArrayBuffer, NormalizedOutput, NormalizedRecord } from './lib/normalize';
-import { fetchRecords } from './lib/fetchRecords';
+import { fetchRecords, FetchRecordsFilters } from './lib/fetchRecords';
 import { fetchProductOptions, insertProduct, ProductOption } from './lib/products';
-import { calculateAverageCostByProduct, updateSaleCostPerKg, deleteNfe } from './lib/salesInvoices';
+import { calculateDailyAverageCost, updateSaleCostPerKg, deleteNfe, calculateStockBalanceForSales, StockBalanceResult } from './lib/salesInvoices';
 
 // Função para formatar data no formato brasileiro (DD/MM/YYYY)
 function formatDateBR(dateStr: string | null): string {
@@ -63,9 +63,11 @@ export default function App() {
   const [noteType, setNoteType] = useState<'' | 'purchase' | 'sale'>('');
   const [view, setView] = useState<'all' | 'purchase' | 'sale'>('all');
   const [selectedMonth, setSelectedMonth] = useState<string>('all'); // 'all' ou 'YYYY-MM'
+  const [selectedDate, setSelectedDate] = useState<string>(''); // YYYY-MM-DD para filtro por dia
   const [editingSaleCost, setEditingSaleCost] = useState<Record<number, string>>({});
   const [calculatingAverage, setCalculatingAverage] = useState<Record<number, boolean>>({});
   const [deleting, setDeleting] = useState<Record<string, boolean>>({});
+  const [stockBalances, setStockBalances] = useState<Map<string, StockBalanceResult>>(new Map());
 
   const effectiveOutput = useMemo<NormalizedOutput | null>(() => {
     if (!output) return null;
@@ -131,6 +133,48 @@ export default function App() {
   const countPurchase = useMemo(() => monthFilteredRecords.filter((r) => r.invoice_type === 'purchase').length, [monthFilteredRecords]);
   const countSale = useMemo(() => monthFilteredRecords.filter((r) => r.invoice_type === 'sale').length, [monthFilteredRecords]);
 
+  // Calcular custo médio ponderado ACUMULADO para cada registro de compra
+  // Agrupa por produto e ordena por data para calcular o custo médio móvel
+  const accumulatedAverageCosts = useMemo<Record<string, number>>(() => {
+    const result: Record<string, number> = {};
+
+    // Filtrar apenas compras e ordenar por data
+    const purchases = records
+      .filter(r => r.invoice_type === 'purchase' && r.product && r.quantity_kg && r.total_value)
+      .sort((a, b) => {
+        // Ordenar por data, depois por produto
+        const dateA = a.invoice_date || '';
+        const dateB = b.invoice_date || '';
+        if (dateA !== dateB) return dateA.localeCompare(dateB);
+        return (a.product || '').localeCompare(b.product || '');
+      });
+
+    // Acumuladores por produto
+    const accumulators: Record<string, { totalQty: number; totalValue: number }> = {};
+
+    for (const purchase of purchases) {
+      const productKey = purchase.product || '';
+      if (!productKey) continue;
+
+      // Inicializar acumulador se não existe
+      if (!accumulators[productKey]) {
+        accumulators[productKey] = { totalQty: 0, totalValue: 0 };
+      }
+
+      // Acumular valores
+      accumulators[productKey].totalQty += Number(purchase.quantity_kg) || 0;
+      accumulators[productKey].totalValue += Number(purchase.total_value) || 0;
+
+      // Calcular média acumulada e armazenar pelo ID do registro
+      if (purchase.id && accumulators[productKey].totalQty > 0) {
+        const avgCost = accumulators[productKey].totalValue / accumulators[productKey].totalQty;
+        result[String(purchase.id)] = Number(avgCost.toFixed(6));
+      }
+    }
+
+    return result;
+  }, [records]);
+
   async function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0] ?? null;
     if (!file) return;
@@ -148,16 +192,46 @@ export default function App() {
     }
   }
 
-  async function onLoadSupabase() {
+  async function onLoadSupabase(dateFilter?: string) {
     setError(null);
     setLoading(true);
     try {
-      const res = await fetchRecords();
+      // Se tiver filtro de data, busca apenas o dia específico
+      const filters: FetchRecordsFilters = {};
+      const dateToUse = dateFilter ?? selectedDate;
+      if (dateToUse) {
+        filters.startDate = dateToUse;
+        filters.endDate = dateToUse;
+      }
+      const res = await fetchRecords(filters);
       setOutput(res);
+
+      // Calcular saldos de estoque para todas as saídas
+      const sales = res.records
+        .filter(r => r.invoice_type === 'sale' && r.product_id && r.invoice_date)
+        .map(r => ({
+          nfeId: String(r.id),
+          productId: r.product_id!,
+          date: r.invoice_date!,
+          quantity: r.quantity_kg || 0
+        }));
+
+      if (sales.length > 0) {
+        const balances = await calculateStockBalanceForSales(sales);
+        setStockBalances(balances);
+      }
     } catch (err: any) {
       setError(String(err?.message ?? err ?? 'Erro ao carregar do Supabase'));
     } finally {
       setLoading(false);
+    }
+  }
+
+  // Função para carregar dados quando a data mudar
+  async function onDateChange(date: string) {
+    setSelectedDate(date);
+    if (date) {
+      await onLoadSupabase(date);
     }
   }
 
@@ -260,15 +334,40 @@ export default function App() {
 
   async function onCalculateAverage(record: NormalizedRecord, index: number) {
     if (!record.product_id || !record.id) return;
+
+    // Usa a data da nota de venda para calcular o custo médio até aquela data
+    const saleDate = record.invoice_date;
+    if (!saleDate) {
+      setError('Nota sem data. Não é possível calcular o custo médio.');
+      return;
+    }
+
     setCalculatingAverage((prev) => ({ ...prev, [index]: true }));
     try {
-      const avgCost = await calculateAverageCostByProduct(record.product_id);
+      // Calcula custo médio ponderado considerando apenas compras ATÉ a data da venda
+      const avgCost = await calculateDailyAverageCost(record.product_id, saleDate);
       if (avgCost !== null) {
-        setEditingSaleCost((prev) => ({ ...prev, [index]: avgCost.toFixed(6) }));
+        // Preenche o campo com o valor calculado
+        setEditingSaleCost((prev) => ({ ...prev, [index]: avgCost.toFixed(2) }));
+
+        // Salva automaticamente no banco
+        await updateSaleCostPerKg(String(record.id), avgCost);
+
+        // Atualiza o registro local
+        if (output) {
+          const updated = { ...output };
+          const idx = updated.records.findIndex(rec => rec.id === record.id);
+          if (idx !== -1) {
+            updated.records[idx] = { ...updated.records[idx], sale_cost_per_kg: avgCost };
+            setOutput(updated);
+          }
+        }
+      } else {
+        setError(`Nenhuma compra encontrada para este produto até ${formatDateBR(saleDate)}`);
       }
     } catch (err: any) {
-      console.error('Error calculating average:', err);
-      setError(String(err?.message ?? 'Erro ao calcular média'));
+      console.error('Error calculating daily average:', err);
+      setError(String(err?.message ?? 'Erro ao calcular média diária'));
     } finally {
       setCalculatingAverage((prev) => ({ ...prev, [index]: false }));
     }
@@ -324,7 +423,7 @@ export default function App() {
           <div className="card-premium p-6">
             <h3 className="text-lg font-semibold gradient-text mb-4">🚀 Ações Rápidas</h3>
             <div className="flex flex-wrap gap-3">
-              <button onClick={onLoadSupabase} className="btn-gradient flex items-center gap-2">
+              <button onClick={() => onLoadSupabase()} className="btn-gradient flex items-center gap-2">
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
                 </svg>
@@ -430,20 +529,49 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Filtro por Mês */}
+              {/* Filtro por Data (direto do banco) */}
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">📅 Período</label>
-                <select
-                  className="w-full px-4 py-2.5 rounded-lg border-2 border-gray-200 focus:border-purple-500 focus:ring-2 focus:ring-purple-200 transition-all font-medium text-sm"
-                  value={selectedMonth}
-                  onChange={(e) => setSelectedMonth(e.target.value)}
-                >
-                  <option value="all">Todos os meses ({records.length})</option>
-                  {availableMonths.map(m => (
-                    <option key={m.value} value={m.value}>{m.label}</option>
-                  ))}
-                </select>
+                <label className="block text-sm font-medium text-gray-700 mb-2">📅 Filtrar por Data</label>
+                <div className="flex gap-2">
+                  <input
+                    type="date"
+                    className="flex-1 px-4 py-2.5 rounded-lg border-2 border-gray-200 focus:border-purple-500 focus:ring-2 focus:ring-purple-200 transition-all font-medium text-sm"
+                    value={selectedDate}
+                    onChange={(e) => onDateChange(e.target.value)}
+                  />
+                  {selectedDate && (
+                    <button
+                      onClick={() => { setSelectedDate(''); onLoadSupabase(''); }}
+                      className="px-4 py-2.5 rounded-lg bg-gray-100 text-gray-700 hover:bg-gray-200 font-medium text-sm transition-all"
+                      title="Limpar filtro de data"
+                    >
+                      ✕ Limpar
+                    </button>
+                  )}
+                </div>
+                {selectedDate && (
+                  <p className="mt-2 text-xs text-gray-500">
+                    Mostrando apenas notas do dia: <strong>{formatDateBR(selectedDate)}</strong>
+                  </p>
+                )}
               </div>
+
+              {/* Filtro por Mês (client-side, quando não há filtro de data) */}
+              {!selectedDate && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">📆 Filtrar por Mês</label>
+                  <select
+                    className="w-full px-4 py-2.5 rounded-lg border-2 border-gray-200 focus:border-purple-500 focus:ring-2 focus:ring-purple-200 transition-all font-medium text-sm"
+                    value={selectedMonth}
+                    onChange={(e) => setSelectedMonth(e.target.value)}
+                  >
+                    <option value="all">Todos os meses ({records.length})</option>
+                    {availableMonths.map(m => (
+                      <option key={m.value} value={m.value}>{m.label}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
             </div>
           </div>
 
@@ -539,9 +667,18 @@ export default function App() {
                             </td>
                             <td className="px-3 py-3 font-semibold text-gray-900">{formatCurrencyBR(r.total_value)}</td>
                             <td className="px-3 py-3">
-                              <span className="inline-block px-3 py-1 bg-blue-100 text-blue-700 rounded-full text-xs font-medium">
-                                {r.average_cost_per_kg !== null ? formatCurrencyBR(r.average_cost_per_kg) : '-'}
-                              </span>
+                              {(() => {
+                                const accCost = r.id ? accumulatedAverageCosts[String(r.id)] : null;
+                                return accCost ? (
+                                  <span className="inline-block px-3 py-1 bg-gradient-to-r from-blue-100 to-cyan-100 text-blue-700 rounded-full text-xs font-medium" title="Custo médio ponderado acumulado">
+                                    {formatCurrencyBR(accCost)}
+                                  </span>
+                                ) : (
+                                  <span className="inline-block px-3 py-1 bg-gray-100 text-gray-500 rounded-full text-xs font-medium">
+                                    -
+                                  </span>
+                                );
+                              })()}
                             </td>
                             <td className="px-3 py-3">
                               <button
@@ -595,16 +732,18 @@ export default function App() {
                         <th className="px-3 py-3 text-left font-semibold">Produto</th>
                         <th className="px-3 py-3 text-left font-semibold">Qtd (kg)</th>
                         <th className="px-3 py-3 text-left font-semibold">Valor Total</th>
-                        <th className="px-3 py-3 text-left font-semibold">Custo Venda/kg</th>
+                        <th className="px-3 py-3 text-left font-semibold">Custo Médio/kg</th>
+                        <th className="px-3 py-3 text-left font-semibold">Saldo Após (kg)</th>
+                        <th className="px-3 py-3 text-left font-semibold">Valor Estoque</th>
                         <th className="px-3 py-3 text-left font-semibold">Ações</th>
                       </tr>
                     </thead>
                     <tbody>
                       {filteredRecords.filter(r => r.invoice_type === 'sale').map((r) => {
                         const originalIndex = records.indexOf(r);
-                        const isEditing = editingSaleCost[originalIndex] !== undefined;
                         const isCalculating = calculatingAverage[originalIndex] ?? false;
-                        const needsCost = !r.sale_cost_per_kg && !isEditing;
+                        const needsCost = !r.sale_cost_per_kg && !editingSaleCost[originalIndex];
+                        const balance = r.id ? stockBalances.get(String(r.id)) : null;
                         return (
                           <tr key={String(r.id)} className={`border-b border-gray-100 hover:bg-gray-50 transition-colors ${needsCost ? 'bg-amber-50' : ''}`}>
                             <td className="px-3 py-3 text-gray-600 text-xs font-mono">
@@ -640,64 +779,69 @@ export default function App() {
                             </td>
                             <td className="px-3 py-3 font-semibold text-gray-900">{formatCurrencyBR(r.total_value)}</td>
                             <td className="px-3 py-3">
-                              {isEditing ? (
-                                <input
-                                  type="text"
-                                  className="w-28 rounded-lg border-2 border-purple-300 px-3 py-1.5 text-sm focus:border-purple-500 focus:ring-2 focus:ring-purple-200 transition-all"
-                                  value={editingSaleCost[originalIndex]}
-                                  onChange={(e) => setEditingSaleCost((prev) => ({ ...prev, [originalIndex]: e.target.value }))}
-                                />
-                              ) : (
-                                <span className={`inline-block px-3 py-1 rounded-full text-xs font-medium ${needsCost
-                                  ? 'bg-amber-100 text-amber-700'
-                                  : 'bg-emerald-100 text-emerald-700'
-                                  }`}>
-                                  {r.sale_cost_per_kg === null ? 'não definido' : r.sale_cost_per_kg}
+                              <input
+                                type="text"
+                                className="w-24 rounded-lg border-2 border-gray-200 px-3 py-1.5 text-sm focus:border-purple-500 focus:ring-2 focus:ring-purple-200 transition-all"
+                                placeholder={balance?.averageCost ? balance.averageCost.toFixed(2) : '0.00'}
+                                value={editingSaleCost[originalIndex] ?? (r.sale_cost_per_kg ? String(r.sale_cost_per_kg) : '')}
+                                onChange={(e) => setEditingSaleCost((prev) => ({ ...prev, [originalIndex]: e.target.value }))}
+                                onBlur={() => {
+                                  const costStr = editingSaleCost[originalIndex];
+                                  if (costStr !== undefined && costStr !== '' && r.id) {
+                                    const cost = Number(costStr.replace(',', '.'));
+                                    if (!isNaN(cost)) {
+                                      updateSaleCostPerKg(String(r.id), cost).then(() => {
+                                        // Atualiza o registro local
+                                        if (output) {
+                                          const updated = { ...output };
+                                          const idx = updated.records.findIndex(rec => rec.id === r.id);
+                                          if (idx !== -1) {
+                                            updated.records[idx] = { ...updated.records[idx], sale_cost_per_kg: cost };
+                                            setOutput(updated);
+                                          }
+                                        }
+                                      });
+                                    }
+                                  }
+                                }}
+                                title="Digite o custo médio em R$/kg"
+                              />
+                            </td>
+                            <td className="px-3 py-3">
+                              {balance ? (
+                                <span className={`inline-block px-3 py-1 rounded-full text-xs font-medium ${balance.balanceKg < 0
+                                  ? 'bg-red-100 text-red-700'
+                                  : balance.balanceKg === 0
+                                    ? 'bg-gray-100 text-gray-600'
+                                    : 'bg-blue-100 text-blue-700'
+                                  }`} title={`Entradas: ${balance.totalEntries} kg | Saídas: ${balance.totalExits} kg`}>
+                                  {balance.balanceKg.toLocaleString('pt-BR', { minimumFractionDigits: 1 })} kg
                                 </span>
+                              ) : (
+                                <span className="inline-block px-3 py-1 bg-gray-100 text-gray-500 rounded-full text-xs">-</span>
+                              )}
+                            </td>
+                            <td className="px-3 py-3">
+                              {balance ? (
+                                <span className={`inline-block px-3 py-1 rounded-full text-xs font-medium ${balance.stockValue < 0
+                                  ? 'bg-red-100 text-red-700'
+                                  : 'bg-green-100 text-green-700'
+                                  }`}>
+                                  {formatCurrencyBR(balance.stockValue)}
+                                </span>
+                              ) : (
+                                <span className="inline-block px-3 py-1 bg-gray-100 text-gray-500 rounded-full text-xs">-</span>
                               )}
                             </td>
                             <td className="px-3 py-2">
-                              <div className="flex gap-2">
-                                {!isEditing ? (
-                                  <>
-                                    <button
-                                      onClick={() => onCalculateAverage(r, originalIndex)}
-                                      disabled={isCalculating || !r.product_id}
-                                      className="bg-gradient-to-r from-blue-500 to-blue-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm hover:shadow-md transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-                                      title="Calcular média ponderada das compras"
-                                    >
-                                      {isCalculating ? '⏳' : '🔢 Calcular'}
-                                    </button>
-                                    <button
-                                      onClick={() => setEditingSaleCost((prev) => ({ ...prev, [originalIndex]: r.sale_cost_per_kg ? String(r.sale_cost_per_kg) : '' }))}
-                                      className="bg-gradient-to-r from-gray-500 to-gray-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm hover:shadow-md transition-all"
-                                    >
-                                      ✏️ Editar
-                                    </button>
-                                  </>
-                                ) : (
-                                  <>
-                                    <button
-                                      onClick={() => onSaveSaleCost(r, originalIndex)}
-                                      className="bg-gradient-to-r from-green-500 to-green-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm hover:shadow-md transition-all"
-                                    >
-                                      ✓ Salvar
-                                    </button>
-                                    <button
-                                      onClick={() => {
-                                        setEditingSaleCost((prev) => {
-                                          const next = { ...prev };
-                                          delete next[originalIndex];
-                                          return next;
-                                        });
-                                      }}
-                                      className="bg-gradient-to-r from-gray-400 to-gray-500 text-white px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm hover:shadow-md transition-all"
-                                    >
-                                      ✕ Cancelar
-                                    </button>
-                                  </>
-                                )}
-                              </div>
+                              <button
+                                onClick={() => onCalculateAverage(r, originalIndex)}
+                                disabled={isCalculating || !r.product_id}
+                                className="bg-gradient-to-r from-blue-500 to-blue-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm hover:shadow-md transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                                title="Preencher com custo médio ponderado das entradas até esta data"
+                              >
+                                {isCalculating ? '⏳' : '🔢 Auto'}
+                              </button>
                             </td>
                           </tr>
                         );

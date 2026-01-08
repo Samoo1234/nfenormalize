@@ -834,14 +834,37 @@ export default function App() {
                               )}
                             </td>
                             <td className="px-3 py-2">
-                              <button
-                                onClick={() => onCalculateAverage(r, originalIndex)}
-                                disabled={isCalculating || !r.product_id}
-                                className="bg-gradient-to-r from-blue-500 to-blue-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm hover:shadow-md transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-                                title="Preencher com custo médio ponderado das entradas até esta data"
-                              >
-                                {isCalculating ? '⏳' : '🔢 Auto'}
-                              </button>
+                              <div className="flex gap-2">
+                                <button
+                                  onClick={() => onCalculateAverage(r, originalIndex)}
+                                  disabled={isCalculating || !r.product_id}
+                                  className="bg-gradient-to-r from-blue-500 to-blue-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm hover:shadow-md transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                                  title="Preencher com custo médio ponderado das entradas até esta data"
+                                >
+                                  {isCalculating ? '⏳' : '🔢 Auto'}
+                                </button>
+                                <button
+                                  onClick={async () => {
+                                    if (!r.id) return;
+                                    if (!confirm('Tem certeza que deseja excluir esta nota?')) return;
+                                    setDeleting((prev) => ({ ...prev, [String(r.id)]: true }));
+                                    try {
+                                      await deleteNfe(String(r.id));
+                                      const res = await fetchRecords();
+                                      setOutput(res);
+                                    } catch (err: any) {
+                                      setError(String(err?.message ?? 'Erro ao excluir'));
+                                    } finally {
+                                      setDeleting((prev) => ({ ...prev, [String(r.id)]: false }));
+                                    }
+                                  }}
+                                  disabled={deleting[String(r.id)]}
+                                  className="bg-gradient-to-r from-red-500 to-red-600 text-white px-3 py-1.5 rounded-lg text-xs font-medium shadow-sm hover:shadow-md transition-all disabled:opacity-50"
+                                  title="Excluir nota"
+                                >
+                                  {deleting[String(r.id)] ? '⏳' : '🗑️ Excluir'}
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         );
